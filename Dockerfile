@@ -10,7 +10,8 @@ RUN addgroup -g ${GID} -S appgroup \
 
 WORKDIR /app
 
-COPY main.go go.mod .
+COPY main.go prompts.go go.mod ./
+COPY prompts ./prompts
 
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /usr/local/bin/hh-ai-responder .
 
