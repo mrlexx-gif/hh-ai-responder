@@ -1296,6 +1296,7 @@ type HHAIResponder struct {
 	ctx                     context.Context
 	baseURL                 *url.URL
 	searchParams            url.Values
+	searchEnabled           bool
 	cookiesPath             string
 	maxResponses            int
 	client                  *http.Client
@@ -1513,6 +1514,26 @@ func (r *HHAIResponder) getBaseHost() string {
 	return defaultHost
 }
 
+// isVacancySearchConfigured reports whether a vacancy search target was provided
+// (via -u or HH_SEARCH_URL). When it is empty the app runs in chat-only mode:
+// vacancies are neither searched nor applied to.
+func isVacancySearchConfigured(searchURL string) bool {
+	return strings.TrimSpace(searchURL) != ""
+}
+
+// resumeSearchParams seeds the search query with the selected resume when the
+// vacancy search is enabled and the URL did not already provide parameters.
+// Without a search URL (chat-only mode) it returns the params untouched, so
+// vacancies are never fetched just because a resume was selected.
+func resumeSearchParams(searchEnabled bool, params url.Values, resumeHash string) url.Values {
+	if !searchEnabled || len(params) > 0 {
+		return params
+	}
+	result := make(url.Values)
+	result.Set("resume", resumeHash)
+	return result
+}
+
 func NewHHAIResponder(ctx context.Context, cfg Config) (*HHAIResponder, error) {
 	var baseURL *url.URL
 	var searchParams url.Values
@@ -1543,6 +1564,7 @@ func NewHHAIResponder(ctx context.Context, cfg Config) (*HHAIResponder, error) {
 	responder := &HHAIResponder{
 		ctx:                     ctx,
 		baseURL:                 baseURL,
+		searchEnabled:           isVacancySearchConfigured(cfg.SearchURL),
 		cookiesPath:             cfg.CookiesPath,
 		maxResponses:            cfg.MaxResponses,
 		client:                  client,
@@ -1605,11 +1627,10 @@ func NewHHAIResponder(ctx context.Context, cfg Config) (*HHAIResponder, error) {
 	}
 	responder.resumeExperience = resumeExperience
 
-	// If no search params provided, add resume parameter
-	if len(responder.searchParams) == 0 {
-		responder.searchParams = make(url.Values)
-		responder.searchParams.Set("resume", responder.resumeHash)
-	}
+	// Параметр resume подставляется только когда поиск включён (задан -u /
+	// HH_SEARCH_URL), но сама ссылка его не содержит. Без ссылки поиска
+	// приложение работает в режиме "только чаты" и вакансии не ищет.
+	responder.searchParams = resumeSearchParams(responder.searchEnabled, responder.searchParams, responder.resumeHash)
 
 	return responder, nil
 }
@@ -2595,6 +2616,20 @@ func cookieEqual(a, b *http.Cookie) bool {
 		a.Expires.Equal(b.Expires)
 }
 
+// isValidCookieValue reports whether value contains only bytes that net/http can
+// put into a Cookie header. hh.ru stores raw JSON (with double quotes) in its
+// client-side "filters*" cookie; net/http silently drops such bytes and logs a
+// noisy `invalid byte '"' in Cookie.Value` warning, so we must not send them.
+func isValidCookieValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if b < 0x20 || b >= 0x7f || b == '"' || b == ';' || b == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
 func NewMemoryPersistentJar(cookiesPath string) (*MemoryPersistentJar, error) {
 	jar := &MemoryPersistentJar{
 		cookies:     make(map[string][]*http.Cookie),
@@ -2732,6 +2767,13 @@ func (j *MemoryPersistentJar) Cookies(u *url.URL) []*http.Cookie {
 					continue
 				}
 
+				// Keep the cookie persisted, but do not hand it to net/http when
+				// it would drop bytes and emit the invalid byte warning.
+				if !isValidCookieValue(cookie.Value) {
+					active = append(active, cookie)
+					continue
+				}
+
 				copied := *cookie
 				matched = append(matched, &copied)
 				active = append(active, cookie)
@@ -2813,7 +2855,13 @@ func (j *MemoryPersistentJar) saveLockedTo(path string) error {
 }
 
 func decodeEmbeddedJSON[T any](data []byte, marker string, out *T) error {
-	_, after, ok := bytes.Cut(data, []byte(marker))
+	after, ok := cutEmbeddedJSON(data, marker)
+	if !ok {
+		// hh.ru embeds its initial state as HTML-escaped JSON, so every quote
+		// shows up as an entity in the raw response. Decode the entities and
+		// retry: a marker that contains quotes would otherwise never match.
+		after, ok = cutEmbeddedJSON([]byte(html.UnescapeString(string(data))), marker)
+	}
 	if !ok {
 		return fmt.Errorf("marker %q not found in response", marker)
 	}
@@ -2825,6 +2873,21 @@ func decodeEmbeddedJSON[T any](data []byte, marker string, out *T) error {
 	}
 
 	return json.Unmarshal(raw, out)
+}
+
+// cutEmbeddedJSON returns the bytes following marker so the value can be decoded
+// as JSON. The marker may carry a leading comma to disambiguate nested keys, but
+// the same field can also be the first key of an object, so the comma is optional.
+func cutEmbeddedJSON(data []byte, marker string) ([]byte, bool) {
+	if _, after, ok := bytes.Cut(data, []byte(marker)); ok {
+		return after, true
+	}
+	if trimmed := strings.TrimPrefix(marker, ","); trimmed != marker {
+		if _, after, ok := bytes.Cut(data, []byte(trimmed)); ok {
+			return after, true
+		}
+	}
+	return nil, false
 }
 
 func parseConfig() (Config, error) {
@@ -3017,75 +3080,82 @@ func parseLogLevel(level string) LogLevel {
 func (r *HHAIResponder) Run() {
 	logger.Info("Starting tasks...")
 
-	// Touch resume loop (every 4h after completion)
-	go func() {
-		for {
-			select {
-			case <-r.ctx.Done():
-				return
-			default:
-			}
+	// Всё, что связано с активным поиском вакансий (поднятие резюме, статус
+	// "в поиске", отклики), запускается только когда задан поиск (-u /
+	// HH_SEARCH_URL). Без него приложение отвечает только в чатах.
+	if r.searchEnabled {
+		// Touch resume loop (every 4h after completion)
+		go func() {
+			for {
+				select {
+				case <-r.ctx.Done():
+					return
+				default:
+				}
 
-			updated, err := r.TouchResume()
-			if err != nil {
-				logger.Error("Touch resume error: %v", err)
-			} else if updated {
-				logger.Info("Resume updated")
-			} else {
-				logger.Warn("Resume not updated (hh.ru declined the touch, usually because it was touched recently)")
-			}
+				updated, err := r.TouchResume()
+				if err != nil {
+					logger.Error("Touch resume error: %v", err)
+				} else if updated {
+					logger.Info("Resume updated")
+				} else {
+					logger.Warn("Resume not updated (hh.ru declined the touch, usually because it was touched recently)")
+				}
 
-			select {
-			case <-r.ctx.Done():
-				return
-			case <-time.After(4 * time.Hour):
+				select {
+				case <-r.ctx.Done():
+					return
+				case <-time.After(4 * time.Hour):
+				}
 			}
-		}
-	}()
+		}()
 
-	go func() {
-		for {
-			select {
-			case <-r.ctx.Done():
-				return
-			default:
-			}
+		go func() {
+			for {
+				select {
+				case <-r.ctx.Done():
+					return
+				default:
+				}
 
-			success, _ := r.SetActiveJobSearchStatus()
-			if success {
-				logger.Info("Job search status is active")
-			} else {
-				logger.Warn("Can't change job search status")
-			}
+				success, _ := r.SetActiveJobSearchStatus()
+				if success {
+					logger.Info("Job search status is active")
+				} else {
+					logger.Warn("Can't change job search status")
+				}
 
-			select {
-			case <-r.ctx.Done():
-				return
-			case <-time.After(24 * time.Hour):
+				select {
+				case <-r.ctx.Done():
+					return
+				case <-time.After(24 * time.Hour):
+				}
 			}
-		}
-	}()
+		}()
 
-	// Apply vacancies loop (every 24h after completion)
-	go func() {
-		for {
-			select {
-			case <-r.ctx.Done():
-				return
-			default:
-			}
+		// Apply vacancies loop (every 12h after completion)
+		go func() {
+			for {
+				select {
+				case <-r.ctx.Done():
+					return
+				default:
+				}
 
-			if err := r.ApplyVacancies(); err != nil {
-				logger.Error("Apply error: %v", err)
-			}
+				if err := r.ApplyVacancies(); err != nil {
+					logger.Error("Apply error: %v", err)
+				}
 
-			select {
-			case <-r.ctx.Done():
-				return
-			case <-time.After(12 * time.Hour):
+				select {
+				case <-r.ctx.Done():
+					return
+				case <-time.After(12 * time.Hour):
+				}
 			}
-		}
-	}()
+		}()
+	} else {
+		logger.Info("No search URL provided: running in chat-only mode, vacancy search and applications are disabled")
+	}
 
 	// Auto chat loop: непрерывно пересканирует чаты на новые сообщения
 	// работодателя (включая автоответы на наши собственные сообщения) и
